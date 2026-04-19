@@ -1,0 +1,24 @@
+{
+  "name": "ai-pr-pipeline",
+  "version": "1.0.0",
+  "description": "AI-powered Linear ticket to GitHub PR pipeline with GCP Cloud Run previews",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "setup:repo": "node src/scripts/setup-repo.js"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.21.0",
+    "@linear/sdk": "^29.0.0",
+    "@octokit/rest": "^21.1.1",
+    "dotenv": "^16.4.7",
+    "express": "^5.1.0",
+    "googleapis": "^148.0.0",
+    "winston": "^3.17.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
