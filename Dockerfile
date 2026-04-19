@@ -1,22 +1,15 @@
-FROM node:20-alpine
+FROM node:20
 
 WORKDIR /app
 
-# Install dependencies
-COPY package.json package-lock.json* ./
-RUN npm ci --omit=dev || npm install --omit=dev
+COPY package*.json./
 
-# Copy source code
-COPY src/ ./src/
+RUN npm install
 
-# Set environment
-ENV NODE_ENV=production
-ENV PORT=8080
+COPY..
 
-EXPOSE 8080
+RUN npm run build
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
-  CMD wget -qO- http://localhost:8080/health || exit 1
+EXPOSE 3000
 
-CMD ["node", "src/index.js"]
+CMD [ "npm", "start" ]
