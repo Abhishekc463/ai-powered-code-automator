@@ -24,7 +24,7 @@ console.log('╔═════════════════════�
 console.log('║        AI PR Pipeline — Direct Execution          ║');
 console.log('╠═══════════════════════════════════════════════════╣');
 console.log(`║  Repo: ${GITHUB_OWNER}/${GITHUB_REPO}`);
-console.log(`║  Target: ABH-5 (Create a hello page)`);
+console.log(`║  Target: ABH-6 (Create a new page for document implementation)`);
 console.log('╚═══════════════════════════════════════════════════╝');
 console.log('');
 
@@ -35,10 +35,10 @@ console.log('━━━ Step 1/4: Fetching Linear ticket... ━━━');
 
 const linear = new LinearClient({ apiKey: LINEAR_API_KEY });
 
-// Search for issue ABH-5
+// Search for issue ABH-6
 const issues = await linear.issues({
   filter: {
-    number: { eq: 5 },
+    number: { eq: 6 },
     team: { key: { eq: 'ABH' } },
   },
 });
@@ -98,10 +98,10 @@ try {
   repoTree = tree.tree.filter(i => i.type === 'blob').map(i => i.path);
 
   // Get key file contents
-  for (const filePath of repoTree.filter(f => 
+  for (const filePath of repoTree.filter(f =>
     ['package.json', 'next.config.ts', 'next.config.mjs', 'tsconfig.json',
-     'src/app/layout.tsx', 'src/app/page.tsx', 'src/app/globals.css',
-     'app/layout.tsx', 'app/page.tsx'].includes(f)
+      'src/app/layout.tsx', 'src/app/page.tsx', 'src/app/globals.css',
+      'app/layout.tsx', 'app/page.tsx'].includes(f)
   )) {
     try {
       const { data } = await octokit.repos.getContent({
@@ -110,13 +110,13 @@ try {
       if (data.type === 'file') {
         repoFiles[filePath] = Buffer.from(data.content, 'base64').toString('utf-8');
       }
-    } catch {}
+    } catch { }
   }
 
   console.log(`✅ Repo has ${repoTree.length} files`);
 } catch (err) {
   console.log('ℹ️  Repo appears to be empty — will scaffold from scratch');
-  
+
   // Create initial commit with README so we have a branch to work from
   await octokit.repos.createOrUpdateFileContents({
     owner: GITHUB_OWNER,
@@ -125,10 +125,10 @@ try {
     message: 'Initial commit',
     content: Buffer.from('# AI Powered Code Automator\n\nNext.js app managed by AI PR Pipeline.\n').toString('base64'),
   });
-  
+
   // Wait a moment for GitHub to process
   await new Promise(r => setTimeout(r, 2000));
-  
+
   const { data: branch } = await octokit.repos.getBranch({
     owner: GITHUB_OWNER, repo: GITHUB_REPO, branch: 'main',
   });
@@ -203,52 +203,78 @@ Include: package.json, next.config.ts, tsconfig.json, src/app/layout.tsx, src/ap
 
 Respond ONLY with the JSON object. No markdown fences, no extra text.`;
 
-console.log('   Sending to OpenRouter (google/gemini-2.0-flash-001)...');
+console.log('   Sending to OpenRouter...');
 
-const openRouterResponse = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-  method: 'POST',
-  headers: {
-    'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
-    'Content-Type': 'application/json',
-    'HTTP-Referer': 'https://github.com/ai-pr-pipeline',
-    'X-Title': 'AI PR Pipeline',
-  },
-  body: JSON.stringify({
-    model: 'google/gemini-2.0-flash-001',
-    messages: [
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: userPrompt },
-    ],
-    temperature: 0.3,
-    max_tokens: 3500,
-    response_format: { type: 'json_object' },
-  }),
-});
+let aiResponse;
+const modelsToTry = [
+  'google/gemini-flash-1.5', 
+  'google/gemini-pro-1.5',
+  'google/gemini-2.0-flash-001',
+  'meta-llama/llama-3.1-70b-instruct' // Fallback to a non-Google model if needed
+];
 
-if (!openRouterResponse.ok) {
-  const errText = await openRouterResponse.text();
-  throw new Error(`OpenRouter API error (${openRouterResponse.status}): ${errText}`);
+for (const modelId of modelsToTry) {
+  try {
+    console.log(`   Trying model: ${modelId}...`);
+    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+        'Content-Type': 'application/json',
+        'HTTP-Referer': 'https://github.com/ai-pr-pipeline',
+        'X-Title': 'AI PR Pipeline',
+      },
+      body: JSON.stringify({
+        model: modelId,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ],
+        temperature: 0.1,
+        max_tokens: 4000,
+        response_format: { type: 'json_object' },
+      }),
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      console.warn(`   ⚠️ Model ${modelId} failed (${response.status}): ${errText.substring(0, 100)}...`);
+      continue;
+    }
+
+    const data = await response.json();
+    const aiText = data.choices[0].message.content;
+
+    console.log('   Parsing AI response...');
+
+    // Robust JSON cleaning
+    let cleanText = aiText.trim();
+    const jsonMatch = cleanText.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      cleanText = jsonMatch[0];
+    }
+
+    try {
+      aiResponse = JSON.parse(cleanText);
+      console.log(`   ✅ Success with ${modelId}`);
+      break; 
+    } catch (err) {
+      console.warn(`   ⚠️ JSON parse failed for ${modelId}, trying next...`);
+      try {
+        const repaired = cleanText.replace(/\n/g, '\\n').replace(/\r/g, '\\r');
+        aiResponse = JSON.parse(repaired);
+        console.log(`   ✅ Success with ${modelId} (repaired JSON)`);
+        break;
+      } catch (e) {}
+    }
+  } catch (err) {
+    console.warn(`   ⚠️ Error with ${modelId}: ${err.message}`);
+  }
 }
 
-const openRouterData = await openRouterResponse.json();
-const aiText = openRouterData.choices[0].message.content;
-
-console.log('   Parsing AI response...');
-
-// Clean the response — remove markdown fences if present
-let cleanText = aiText.trim();
-if (cleanText.startsWith('```json')) {
-  cleanText = cleanText.slice(7);
+if (!aiResponse) {
+  throw new Error('All OpenRouter models failed. Please check your account and credits.');
 }
-if (cleanText.startsWith('```')) {
-  cleanText = cleanText.slice(3);
-}
-if (cleanText.endsWith('```')) {
-  cleanText = cleanText.slice(0, -3);
-}
-cleanText = cleanText.trim();
-
-const aiResponse = JSON.parse(cleanText);
 
 console.log(`✅ AI generated ${aiResponse.changes.length} file(s): "${aiResponse.summary}"`);
 aiResponse.changes.forEach(c => console.log(`   ${c.action === 'create' ? '🆕' : '✏️'} ${c.path} — ${c.reason}`));
@@ -259,7 +285,7 @@ console.log('');
 // ═══════════════════════════════════════════
 console.log('━━━ Step 4/4: Creating GitHub PR... ━━━');
 
-const branchName = `ai/abh-5-create-hello-page`;
+const branchName = `ai/abh-6-docs-final`;
 
 // Create branch
 console.log(`   Creating branch: ${branchName}`);
@@ -292,10 +318,13 @@ const baseTreeSha = commitData.tree.sha;
 console.log('   Creating file blobs...');
 const treeItems = [];
 for (const change of aiResponse.changes) {
-  if (!change.content) continue;
+  const content = typeof change.content === 'string' 
+    ? change.content 
+    : JSON.stringify(change.content, null, 2);
+    
   const { data: blob } = await octokit.git.createBlob({
     owner: GITHUB_OWNER, repo: GITHUB_REPO,
-    content: Buffer.from(change.content).toString('base64'),
+    content: Buffer.from(content).toString('base64'),
     encoding: 'base64',
   });
   treeItems.push({ path: change.path, mode: '100644', type: 'blob', sha: blob.sha });

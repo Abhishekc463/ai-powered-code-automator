@@ -7,7 +7,9 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
-    "setup:repo": "node src/scripts/setup-repo.js"
+    "setup:repo": "node src/scripts/setup-repo.js",
+    "poll": "node src/scripts/poll-agent.js",
+    "run-ticket": "node src/scripts/run-ticket.js"
   },
   "dependencies": {
     "@google/generative-ai": "^0.21.0",

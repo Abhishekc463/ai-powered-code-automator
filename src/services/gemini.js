@@ -1,72 +1,11 @@
-import { GoogleGenerativeAI, SchemaType } from '@google/generative-ai';
 import { config } from '../config.js';
 import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('GeminiService');
 
-let genAI;
-let model;
-
-function getModel() {
-  if (!model) {
-    genAI = new GoogleGenerativeAI(config.gemini.apiKey);
-    model = genAI.getGenerativeModel({
-      model: config.gemini.model,
-      generationConfig: {
-        temperature: 0.3,
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: SchemaType.OBJECT,
-          properties: {
-            summary: {
-              type: SchemaType.STRING,
-              description: 'A concise summary of the changes being made',
-            },
-            changes: {
-              type: SchemaType.ARRAY,
-              items: {
-                type: SchemaType.OBJECT,
-                properties: {
-                  path: {
-                    type: SchemaType.STRING,
-                    description: 'File path relative to the project root',
-                  },
-                  action: {
-                    type: SchemaType.STRING,
-                    description: 'One of: create, update, delete',
-                    enum: ['create', 'update', 'delete'],
-                  },
-                  content: {
-                    type: SchemaType.STRING,
-                    description: 'Full file content (for create/update actions)',
-                  },
-                  reason: {
-                    type: SchemaType.STRING,
-                    description: 'Why this file is being changed',
-                  },
-                },
-                required: ['path', 'action', 'reason'],
-              },
-            },
-            commitMessage: {
-              type: SchemaType.STRING,
-              description: 'A conventional commit message for these changes',
-            },
-            prTitle: {
-              type: SchemaType.STRING,
-              description: 'A clear PR title',
-            },
-          },
-          required: ['summary', 'changes', 'commitMessage', 'prTitle'],
-        },
-      },
-    });
-  }
-  return model;
-}
-
 /**
  * Generate code changes based on a Linear ticket and the current repo state.
+ * Uses OpenRouter (OpenAI-compatible) API with automatic model fallback.
  *
  * @param {Object} ticket - Linear ticket details
  * @param {Object} repoContext - Current repo state (tree + key file contents)
@@ -78,88 +17,133 @@ export async function generateCodeChanges(ticket, repoContext) {
   const systemPrompt = buildSystemPrompt();
   const userPrompt = buildUserPrompt(ticket, repoContext);
 
-  const aiModel = getModel();
+  const modelsToTry = [
+    'google/gemini-flash-1.5',
+    'google/gemini-pro-1.5',
+    'google/gemini-2.0-flash-001',
+    'meta-llama/llama-3.1-70b-instruct'
+  ];
 
-  const chat = aiModel.startChat({
-    systemInstruction: systemPrompt,
-  });
+  let aiResponse;
 
-  log.info('Sending request to Gemini...');
-  const result = await chat.sendMessage(userPrompt);
-  const response = result.response;
-  const text = response.text();
+  for (const modelId of modelsToTry) {
+    try {
+      log.info(`Trying model: ${modelId}...`);
+      
+      const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${config.gemini.apiKey}`,
+          'Content-Type': 'application/json',
+          'HTTP-Referer': 'https://github.com/ai-pr-pipeline',
+          'X-Title': 'AI PR Pipeline',
+        },
+        body: JSON.stringify({
+          model: modelId,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt },
+          ],
+          temperature: 0.1,
+          max_tokens: 4000,
+          response_format: { type: 'json_object' },
+        }),
+      });
 
-  log.debug('Raw Gemini response length:', { length: text.length });
+      if (!response.ok) {
+        const errText = await response.text();
+        log.warn(`Model ${modelId} failed (${response.status}): ${errText.substring(0, 100)}...`);
+        continue;
+      }
 
-  let parsed;
-  try {
-    parsed = JSON.parse(text);
-  } catch (err) {
-    log.error('Failed to parse Gemini response as JSON', { error: err.message });
-    throw new Error('Gemini returned invalid JSON');
+      const data = await response.json();
+      const aiText = data.choices[0].message.content;
+
+      // Robust JSON cleaning
+      let cleanText = aiText.trim();
+      const jsonMatch = cleanText.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        cleanText = jsonMatch[0];
+      }
+
+      try {
+        aiResponse = JSON.parse(cleanText);
+        log.info(`✅ Success with ${modelId}`);
+        break;
+      } catch (err) {
+        log.warn(`JSON parse failed for ${modelId}, trying repair...`);
+        try {
+          const repaired = cleanText.replace(/\n/g, '\\n').replace(/\r/g, '\\r');
+          aiResponse = JSON.parse(repaired);
+          log.info(`✅ Success with ${modelId} (repaired)`);
+          break;
+        } catch (e) {
+          log.warn(`Repair failed for ${modelId}`);
+        }
+      }
+    } catch (err) {
+      log.error(`Error with ${modelId}: ${err.message}`);
+    }
+  }
+
+  if (!aiResponse) {
+    throw new Error('All AI models failed. Please check your OpenRouter account.');
   }
 
   // Validate the response
-  if (!parsed.changes || !Array.isArray(parsed.changes)) {
-    throw new Error('Gemini response missing "changes" array');
+  if (!aiResponse.changes || !Array.isArray(aiResponse.changes)) {
+    throw new Error('AI response missing "changes" array');
   }
 
-  log.info(`Gemini generated ${parsed.changes.length} file change(s): ${parsed.summary}`);
-
-  return parsed;
+  return aiResponse;
 }
 
 function buildSystemPrompt() {
   return `You are an expert senior full-stack developer specializing in Next.js 15+, React 19, and TypeScript.
-
 Your job is to implement features and fix bugs in a Next.js web application based on Linear ticket descriptions.
 
-## Rules
-1. Generate COMPLETE file contents — never use placeholders like "// ... rest of the code" or "/* existing code */".
-2. For "update" actions, provide the ENTIRE updated file content, not just the diff.
-3. Follow Next.js App Router conventions (app/ directory, page.tsx, layout.tsx, etc.).
+Rules:
+1. Generate COMPLETE file contents — never use placeholders.
+2. For "update" actions, provide the ENTIRE updated file content.
+3. Follow Next.js App Router conventions (app/ directory).
 4. Use TypeScript (.tsx/.ts) for all new files.
-5. Write clean, production-quality code with proper error handling.
-6. Include necessary imports and type definitions.
-7. If adding a new page, also update navigation if applicable.
-8. Use modern React patterns (Server Components by default, "use client" only when needed).
-9. Ensure all code is properly formatted and follows best practices.
-10. If the ticket is ambiguous, make reasonable assumptions and document them in the PR title/summary.
-11. Do NOT modify package.json unless absolutely necessary (e.g., new dependencies are needed).
-12. If you need to add a dependency, create an "update" action for package.json with the full updated content.
-13. Generate semantic, conventional commit messages (e.g., "feat: add user profile page").
-14. Use Tailwind CSS if it's already configured in the project, otherwise use CSS modules.
+5. Write production-quality code with proper styling.
+6. Use modern React patterns (Server Components by default, "use client" only when needed).
+7. Generate conventional commit messages.
+8. If the repo is empty/new, scaffold a complete Next.js project structure.
+9. Include package.json, next.config.ts, tsconfig.json, src/app/layout.tsx, src/app/globals.css, and the requested page.
+10. Use the Next.js standalone output mode in next.config for Docker compatibility.
+11. Include a Dockerfile for the Next.js app.
 
-## File Structure Conventions
-- Pages go in src/app/ or app/
-- Components go in src/components/
-- Utilities go in src/lib/ or src/utils/
-- Types go in src/types/
-- API routes go in src/app/api/`;
+You MUST respond with valid JSON in this exact format:
+{
+  "summary": "Brief summary of changes",
+  "changes": [
+    {
+      "path": "relative/file/path",
+      "action": "create",
+      "content": "full file content here",
+      "reason": "why this file is needed"
+    }
+  ],
+  "commitMessage": "feat: description",
+  "prTitle": "PR title here"
+}`;
 }
 
 function buildUserPrompt(ticket, repoContext) {
   const { tree, fileContents } = repoContext;
 
   let prompt = `## Linear Ticket
-
 **ID**: ${ticket.identifier}
 **Title**: ${ticket.title}
-**Priority**: ${ticket.priorityLabel || 'None'}
 
 **Description**:
 ${ticket.description || 'No description provided.'}
 `;
 
-  if (ticket.comments && ticket.comments.length > 0) {
-    prompt += `\n**Additional context from comments**:\n`;
-    ticket.comments.forEach((comment, i) => {
-      prompt += `- Comment ${i + 1}: ${comment}\n`;
-    });
-  }
-
   prompt += `\n## Current Repository State\n\n`;
-  prompt += `### File Tree\n\`\`\`\n${tree.join('\n')}\n\`\`\`\n\n`;
+  prompt += `### File Tree\n\`\`\`\n${tree.length > 0 ? tree.join('\n') : '(empty repo)'}\n\`\`\`\n\n`;
 
   if (Object.keys(fileContents).length > 0) {
     prompt += `### Key File Contents\n\n`;
@@ -169,13 +153,8 @@ ${ticket.description || 'No description provided.'}
   }
 
   prompt += `\n## Task
-Implement the changes described in the Linear ticket above. Analyze the current codebase structure and generate the necessary file changes.
-
-Return a JSON object with:
-- "summary": Brief summary of what you changed
-- "changes": Array of file changes (each with path, action, content, reason)
-- "commitMessage": A conventional commit message
-- "prTitle": A clear PR title`;
+Implement the changes described in the Linear ticket. 
+Respond ONLY with the JSON object.`;
 
   return prompt;
 }
