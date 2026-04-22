@@ -16,6 +16,13 @@ import {
   buildLinearComment,
   buildPreviewComment,
 } from '../utils/templates.js';
+import {
+  isGStackAvailable,
+  reviewCodeChanges,
+  investigateIssue,
+  generateQualityReport,
+  formatReviewForPR,
+} from '../services/gstack.js';
 
 const log = createLogger('Orchestrator');
 
@@ -39,14 +46,20 @@ export async function runPipeline(issueId) {
 
   try {
     log.info(`═══ Pipeline started for issue: ${issueId} ═══`);
+    
+    // Check if gstack is available
+    const gstackEnabled = isGStackAvailable();
+    if (gstackEnabled) {
+      log.info('✨ gstack skills enabled - enhanced quality checks active');
+    }
 
     // ── Step 1: Fetch ticket details ──────────────────────────
-    log.info('Step 1/5: Fetching ticket details from Linear...');
+    log.info('Step 1/6: Fetching ticket details from Linear...');
     const ticket = await getIssueDetails(issueId);
     log.info(`Ticket: ${ticket.identifier} — "${ticket.title}"`);
 
     // ── Step 2: Ensure repo exists & get context ──────────────
-    log.info('Step 2/5: Preparing repository context...');
+    log.info('Step 2/6: Preparing repository context...');
     const isNewRepo = await ensureRepoExists();
     if (isNewRepo) {
       log.info('New repo created — waiting for GitHub to initialize...');
@@ -56,8 +69,16 @@ export async function runPipeline(issueId) {
     const repoContext = await getRepoContext();
     log.info(`Repo has ${repoContext.tree.length} files`);
 
+    // ── Step 2.5: Investigate issue (gstack methodology) ──────
+    let investigation = null;
+    if (gstackEnabled) {
+      log.info('🔍 Step 2.5/6: Investigating issue systematically (gstack)...');
+      investigation = await investigateIssue(ticket, repoContext);
+      log.info(`Investigation: ${investigation.hypothesis.length} hypotheses identified`);
+    }
+
     // ── Step 3: Generate code changes with AI ─────────────────
-    log.info('Step 3/5: Generating code changes with Gemini AI...');
+    log.info('Step 3/6: Generating code changes with Gemini AI...');
     const aiResult = await generateCodeChanges(ticket, repoContext);
     log.info(`AI generated: ${aiResult.changes.length} changes — "${aiResult.summary}"`);
 
@@ -74,8 +95,22 @@ export async function runPipeline(issueId) {
       throw new Error('AI generated no valid file changes');
     }
 
+    // ── Step 3.5: Code Review (gstack methodology) ────────────
+    let reviewResult = null;
+    let qualityReport = null;
+    if (gstackEnabled) {
+      log.info('📋 Step 3.5/6: Running code review (gstack)...');
+      reviewResult = await reviewCodeChanges(validChanges);
+      qualityReport = generateQualityReport(reviewResult, investigation);
+      log.info(`Review score: ${qualityReport.score.toFixed(1)}/10 — ${reviewResult.passed ? 'PASSED' : 'NEEDS WORK'}`);
+      
+      if (reviewResult.findings.length > 0) {
+        log.info(`Found ${reviewResult.findings.length} issues during review`);
+      }
+    }
+
     // ── Step 4: Create branch, commit, and open PR ────────────
-    log.info('Step 4/5: Creating GitHub PR...');
+    log.info('Step 4/6: Creating GitHub PR...');
     const branchName = `ai/${ticket.identifier.toLowerCase().replace(/\s+/g, '-')}`;
 
     await createBranch(branchName);
@@ -95,22 +130,44 @@ export async function runPipeline(issueId) {
     });
 
     // Add labels
-    await addLabelsToPR(pr.number, ['ai-generated', 'automated']);
+    const labels = ['ai-generated', 'automated'];
+    if (gstackEnabled && reviewResult) {
+      if (reviewResult.passed) {
+        labels.push('review-passed');
+      } else {
+        labels.push('needs-review');
+      }
+    }
+    await addLabelsToPR(pr.number, labels);
+
+    // Post gstack review results as PR comment
+    if (gstackEnabled && reviewResult) {
+      const reviewComment = formatReviewForPR(reviewResult, qualityReport);
+      await commentOnPR(pr.number, reviewComment);
+      log.info('Posted gstack review results to PR');
+    }
 
     // Post comment on Linear ticket
-    await commentOnIssue(
-      issueId,
-      buildLinearComment({
-        prUrl: pr.html_url,
-        previewUrl: null,
-        changedFiles: validChanges,
-      })
-    );
+    let linearComment = buildLinearComment({
+      prUrl: pr.html_url,
+      previewUrl: null,
+      changedFiles: validChanges,
+    });
+    
+    // Add quality score to Linear comment if available
+    if (gstackEnabled && qualityReport) {
+      linearComment += `\n\n**Code Quality:** ${qualityReport.score.toFixed(1)}/10 ${reviewResult.passed ? '✅' : '⚠️'}`;
+      if (!reviewResult.passed) {
+        linearComment += '\n*Review found issues that should be addressed.*';
+      }
+    }
+    
+    await commentOnIssue(issueId, linearComment);
 
     log.info(`PR #${pr.number} created: ${pr.html_url}`);
 
     // ── Step 5: Deploy preview ────────────────────────────────
-    log.info('Step 5/5: Deploying preview to Cloud Run...');
+    log.info('Step 5/6: Deploying preview to Cloud Run...');
     let previewUrl;
     try {
       previewUrl = await deployPreview({
@@ -150,6 +207,9 @@ export async function runPipeline(issueId) {
     log.info(`═══ Pipeline completed in ${elapsed}s ═══`);
     log.info(`  PR: ${pr.html_url}`);
     log.info(`  Preview: ${previewUrl || 'N/A'}`);
+    if (gstackEnabled && qualityReport) {
+      log.info(`  Quality: ${qualityReport.score.toFixed(1)}/10 ${reviewResult.passed ? '✅' : '⚠️'}`);
+    }
 
     return {
       pr: {
@@ -159,6 +219,12 @@ export async function runPipeline(issueId) {
       previewUrl,
       changesCount: validChanges.length,
       elapsed,
+      quality: gstackEnabled ? {
+        score: qualityReport.score,
+        passed: reviewResult.passed,
+        findings: reviewResult.findings.length,
+        recommendations: reviewResult.recommendations.length,
+      } : null,
     };
   } catch (err) {
     log.error(`Pipeline failed for issue ${issueId}`, { error: err.message, stack: err.stack });

@@ -4,3 +4,8 @@ node_modules/
 dist/
 service-account.json
 .DS_Store
+
+# gstack build artifacts (exclude large binaries, keep source)
+.claude/skills/gstack/node_modules/
+.claude/skills/gstack/**/*.exe
+.claude/skills/gstack/.git/
